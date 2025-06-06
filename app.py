@@ -2,175 +2,158 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import joblib
+import seaborn as sns
+import plotly.graph_objs as go
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from io import BytesIO
 
-# Cache data loading and preprocessing
-@st.cache_data
-def load_and_preprocess(uploaded_file):
-    df = pd.read_csv(uploaded_file, skiprows=1)
-    df.replace('X', pd.NA, inplace=True)
-    
-    numeric_columns = ['% WEIGHTED ILI', '%UNWEIGHTED ILI', 'AGE 0-4', 
-                      'AGE 25-49', 'AGE 25-64', 'AGE 5-24', 'AGE 50-64', 
-                      'AGE 65', 'ILITOTAL', 'NUM. OF PROVIDERS', 'TOTAL PATIENTS']
-    
-    df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors='coerce')
-    df['DATE'] = pd.to_datetime(df['YEAR'].astype(str) + df['WEEK'].astype(str) + '1', 
-                               format='%Y%W%w')
-    df.set_index('DATE', inplace=True)
-    df.fillna(method='ffill', inplace=True)
-    return df
+st.set_page_config(page_title="ILI Forecasting", layout="wide")
 
-st.title("🦠 Advanced ILI Forecasting Dashboard")
-st.markdown("### Multi-Model Comparison with Temporal Validation")
+# Custom CSS Styling
+st.markdown("""
+    <style>
+        .main {
+            background-color: #f9f9f9;
+            color: #1a1a1a;
+        }
+        h1, h2, h3 {
+            color: #0077b6;
+        }
+        .stButton>button {
+            background-color: #0077b6;
+            color: white;
+        }
+        .stDownloadButton>button {
+            background-color: #48cae4;
+            color: white;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-with st.expander("ℹ️ How to use this app"):
-    st.write("""
-    1. Upload your ILI surveillance data (CSV format)
-    2. Select target variable and features
-    3. Adjust model parameters
-    4. View performance metrics and forecasts
-    """)
+# Title
+st.title("🦠 Influenza-Like Illness (ILI) Forecasting using ML Models")
 
-uploaded_file = st.file_uploader("Upload CDC-style ILI data", type=["csv"], 
-                                help="Expected format: CDC CSV structure with weekly reports")
+# File Upload
+uploaded_file = st.file_uploader("📁 Upload CSV file", type=["csv"])
 
 if uploaded_file:
-    df = load_and_preprocess(uploaded_file)
-    
-    # Data preview section
-    with st.expander("🔍 Data Preview"):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**First 5 rows:**")
-            st.dataframe(df.head())
-        with col2:
-            st.write("**Summary Statistics:**")
-            st.write(df.describe())
+    st.sidebar.markdown("## ⚙️ Model & Data Settings")
+    df = pd.read_csv(uploaded_file, skiprows=1)
+    df.replace('X', pd.NA, inplace=True)
 
-    # Feature Selection
-    st.sidebar.header("⚙️ Model Configuration")
-    target = st.sidebar.selectbox("Target Variable", df.select_dtypes(include=np.number).columns)
-    available_features = [col for col in df.columns if col != target]
-    selected_features = st.sidebar.multiselect("Features", available_features, 
-                                              default=['AGE 0-4', 'TOTAL PATIENTS'],
-                                              help="Select epidemiological features")
+    # Convert numeric
+    numeric_columns = ['% WEIGHTED ILI', '%UNWEIGHTED ILI', 'AGE 0-4', 'AGE 25-49',
+                       'AGE 25-64', 'AGE 5-24', 'AGE 50-64', 'AGE 65', 'ILITOTAL',
+                       'NUM. OF PROVIDERS', 'TOTAL PATIENTS']
+    df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors='coerce')
 
-    # Model parameters
-    model_choice = st.sidebar.radio("Models", ["Random Forest", "Decision Tree"], 
-                                   help="Compare different tree-based approaches")
-    
-    n_splits = st.sidebar.slider("Time Series Splits", 3, 10, 5,
-                                help="Number of temporal cross-validation splits")
-    
-    # Enhanced model configuration
-    if model_choice == "Random Forest":
-        n_estimators = st.sidebar.slider("Number of Trees", 50, 500, 100)
-        max_depth = st.sidebar.slider("Max Depth", 2, 20, 5)
-    else:
-        max_depth = st.sidebar.slider("Max Depth", 2, 20, 5)
+    # Date conversion
+    df['DATE'] = pd.to_datetime(df['YEAR'].astype(str) + df['WEEK'].astype(str) + '1', format='%Y%W%w')
+    df.set_index('DATE', inplace=True)
+    df.fillna(method='ffill', inplace=True)
 
-    # Temporal cross-validation
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    # Preview & Summary
+    with st.expander("🔍 Preview & Summary"):
+        st.dataframe(df.head(10))
+        st.dataframe(df.describe())
+
+    # Date Range Filtering
+    min_date, max_date = df.index.min(), df.index.max()
+    date_range = st.sidebar.date_input("📅 Filter Date Range", [min_date, max_date], min_value=min_date, max_value=max_date)
+    if len(date_range) == 2:
+        df = df.loc[date_range[0]:date_range[1]]
+
+    # Feature selection
+    target = st.sidebar.selectbox("🎯 Target Variable", numeric_columns)
+    selected_features = st.sidebar.multiselect("📌 Input Features", df.columns, default=['YEAR', 'AGE 0-4', 'AGE 25-49'])
+    if target in selected_features:
+        selected_features.remove(target)
+
     X = df[selected_features]
     y = df[target]
 
-    # Progress indicators
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Model training with caching
-    @st.cache_resource
-    def train_model(_model, X_train, y_train):
-        return _model.fit(X_train, y_train)
+    # Optional Normalization
+    normalize = st.sidebar.checkbox("🔄 Normalize Input Features")
+    if normalize:
+        scaler = StandardScaler()
+        X = pd.DataFrame(scaler.fit_transform(X), index=X.index, columns=selected_features)
 
-    metrics = []
-    feature_importances = []
-    
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
-        with st.spinner(f"Training fold {fold+1}/{n_splits}..."):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            
-            if model_choice == "Random Forest":
-                model = RandomForestRegressor(n_estimators=n_estimators, 
-                                            max_depth=max_depth,
-                                            random_state=42)
-            else:
-                model = DecisionTreeRegressor(max_depth=max_depth,
-                                            random_state=42)
-            
-            model = train_model(model, X_train, y_train)
-            y_pred = model.predict(X_test)
-            
-            # Store metrics
-            fold_metrics = {
-                'fold': fold+1,
-                'MAE': mean_absolute_error(y_test, y_pred),
-                'RMSE': np.sqrt(mean_squared_error(y_test, y_pred)),
-                'R²': r2_score(y_test, y_pred)
-            }
-            metrics.append(fold_metrics)
-            
-            # Feature importance analysis
-            if model_choice == "Random Forest":
-                importances = model.feature_importances_
-            else:
-                result = permutation_importance(model, X_test, y_test, n_repeats=10)
-                importances = result.importances_mean
-                
-            feature_importances.append(pd.Series(importances, index=selected_features))
-            
-            progress_bar.progress((fold+1)/n_splits)
-    
-    st.toast("✅ Training completed!", icon="✅")
-    
-    # Performance visualization
-    st.header("📊 Model Evaluation")
-    metrics_df = pd.DataFrame(metrics).set_index('fold')
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Average MAE", f"{metrics_df.MAE.mean():.2f} ± {metrics_df.MAE.std():.2f}")
-    with col2:
-        st.metric("Average RMSE", f"{metrics_df.RMSE.mean():.2f} ± {metrics_df.RMSE.std():.2f}")
-    with col3:
-        st.metric("Average R²", f"{metrics_df['R²'].mean():.2f} ± {metrics_df['R²'].std():.2f}")
-    
-    # Feature importance visualization
-    st.subheader("🔍 Feature Importance Analysis")
-    importance_df = pd.concat(feature_importances, axis=1).mean(axis=1).sort_values()
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    importance_df.plot(kind='barh', ax=ax)
-    ax.set_title("Aggregated Feature Importances")
-    ax.set_xlabel("Importance Score")
-    st.pyplot(fig)
-    
-    # Forecast visualization
-    st.subheader("📈 Temporal Validation Results")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    df[target].plot(ax=ax, label='Actual', color='blue')
-    
-    # Generate predictions for visualization
-    full_pred = model.predict(X)
-    ax.plot(df.index, full_pred, label='Predicted', linestyle='--', color='red')
-    
-    ax.set_title(f"{model_choice} Forecast vs Actuals")
-    ax.legend()
-    st.pyplot(fig)
-    
-    # Model persistence
-    st.download_button("💾 Download Trained Model",
-                      data=joblib.dump(model, 'model.joblib')[0],
-                      file_name="ili_forecast_model.joblib",
-                      mime="application/octet-stream")
+    # Split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
-# Add footer
-st.markdown("---")
-st.caption("Built with Streamlit | Best practices from epidemiological forecasting research [1][3][6]")
+    # Model
+    model_choice = st.sidebar.radio("🧠 Choose Model", ["Random Forest", "Decision Tree"])
+    model = RandomForestRegressor(n_estimators=100, random_state=42) if model_choice == "Random Forest" else DecisionTreeRegressor(random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    # Metrics
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+
+    st.subheader("📈 Model Performance")
+    st.success(f"**MAE:** {mae:.4f}")
+    st.success(f"**RMSE:** {rmse:.4f}")
+    st.success(f"**R² Score:** {r2:.4f}")
+
+    # Plotly Chart
+    st.subheader("📉 Actual vs Predicted (Interactive)")
+    fig_plotly = go.Figure()
+    fig_plotly.add_trace(go.Scatter(x=y_test.index, y=y_test, mode='lines', name='Actual', line=dict(color='blue')))
+    fig_plotly.add_trace(go.Scatter(x=y_test.index, y=y_pred, mode='lines', name='Predicted', line=dict(color='red', dash='dash')))
+    fig_plotly.update_layout(title=f"{model_choice}: {target} Forecast", xaxis_title='Date', yaxis_title=target)
+    st.plotly_chart(fig_plotly, use_container_width=True)
+
+    # Feature importance
+    if model_choice == "Random Forest":
+        st.subheader("📊 Feature Importance")
+        importances = pd.Series(model.feature_importances_, index=selected_features)
+        sorted_imp = importances.sort_values(ascending=True)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sorted_imp.plot(kind='barh', color='green', ax=ax)
+        ax.set_title("Feature Importance")
+        st.pyplot(fig)
+
+    # Correlation heatmap
+    st.subheader("🧪 Correlation Matrix")
+    fig_corr, ax_corr = plt.subplots(figsize=(10, 8))
+    sns.heatmap(df[numeric_columns].corr(), annot=True, fmt=".2f", cmap="coolwarm", ax=ax_corr)
+    st.pyplot(fig_corr)
+
+    # Download option
+    st.subheader("💾 Download Forecasts")
+    output_df = pd.DataFrame({
+        "Date": y_test.index,
+        "Actual": y_test.values,
+        "Predicted": y_pred
+    })
+    buffer = BytesIO()
+    output_df.to_csv(buffer, index=False)
+    st.download_button("📥 Download CSV", buffer.getvalue(), "ILI_Forecast.csv", mime="text/csv")
+
+    # Sidebar info
+    with st.sidebar.expander("🧠 About This App"):
+        st.markdown("""
+        - **Goal**: Forecast Influenza-Like Illness cases.
+        - **Models**: Random Forest & Decision Tree.
+        - **Input**: Weekly records of age groups, ILI data, provider counts.
+        - **Output**: Forecast + Evaluation + Graphs.
+        """)
+
+    # FAQ
+    with st.expander("❓ FAQ / About Model"):
+        st.markdown("""
+        **Q: What is ILI?**  
+        A: Influenza-Like Illness is a syndrome defined by symptoms such as fever, cough, and sore throat.
+
+        **Q: Which model is better?**  
+        A: Random Forest usually performs better in generalizing for time-based health data.
+
+        **Q: Can I add more models?**  
+        A: Yes! You can extend the code with XGBoost, SVR, or LSTM models.
+        """)
